@@ -1,0 +1,85 @@
+name: CI with Security Checks
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install project dependencies
+        run: |
+          python -m venv "$RUNNER_TEMP/lab-app"
+          "$RUNNER_TEMP/lab-app/bin/python" -m pip install -r requirements.txt
+          "$RUNNER_TEMP/lab-app/bin/python" -m pip check
+          mkdir -p .scan-target
+          "$RUNNER_TEMP/lab-app/bin/python" -m pip freeze > .scan-target/requirements.txt
+          cat .scan-target/requirements.txt
+      - name: Install isolated security tools
+        run: |
+          python -m venv "$RUNNER_TEMP/lab-safety"
+          python -m venv "$RUNNER_TEMP/lab-audit"
+          python -m venv "$RUNNER_TEMP/lab-bandit"
+          "$RUNNER_TEMP/lab-safety/bin/python" -m pip install safety
+          "$RUNNER_TEMP/lab-audit/bin/python" -m pip install pip-audit
+          "$RUNNER_TEMP/lab-bandit/bin/python" -m pip install bandit
+      - name: Run Tests
+        id: tests
+        continue-on-error: true
+        run: '"$RUNNER_TEMP/lab-app/bin/python" -m pytest tests/ -v'
+      - name: Security Check 1 - Safety Dependency Scan
+        id: safety
+        continue-on-error: true
+        env:
+          SAFETY_API_KEY: ${{ secrets.SAFETY_API_KEY }}
+        run: |
+          if [ -z "$SAFETY_API_KEY" ]; then
+            echo "::error::Set the SAFETY_API_KEY repository secret. Safety did not scan."
+            exit 2
+          fi
+          "$RUNNER_TEMP/lab-safety/bin/safety" scan --target .scan-target --detailed-output
+      - name: Additional Dependency Scan - pip-audit with CVE aliases
+        id: audit
+        continue-on-error: true
+        run: '"$RUNNER_TEMP/lab-audit/bin/python" -m pip_audit -r .scan-target/requirements.txt --aliases on --desc on'
+      - name: Security Check 2 - Code Security Scan
+        id: bandit
+        continue-on-error: true
+        run: '"$RUNNER_TEMP/lab-bandit/bin/python" -m bandit -r src/ -ll'
+      - name: Report actual step outcomes
+        if: always()
+        env:
+          TEST_RESULT: ${{ steps.tests.outcome }}
+          SAFETY_RESULT: ${{ steps.safety.outcome }}
+          AUDIT_RESULT: ${{ steps.audit.outcome }}
+          BANDIT_RESULT: ${{ steps.bandit.outcome }}
+        run: |
+          {
+            echo '## Test and security outcomes'
+            echo '| Check | Outcome |'
+            echo '| --- | --- |'
+            echo "| Tests | $TEST_RESULT |"
+            echo "| Safety | $SAFETY_RESULT |"
+            echo "| pip-audit | $AUDIT_RESULT |"
+            echo "| Bandit (medium/high severity) | $BANDIT_RESULT |"
+            echo ''
+            echo 'continue-on-error keeps scans running; a green job alone does not prove a clean scan.'
+            echo 'Read all scan logs. Authentication, network, or configuration errors are not vulnerability findings or clean results.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$TEST_RESULT" != success ]; then
+            echo "::error::Unit tests did not pass."
+            exit 1
+          fi
